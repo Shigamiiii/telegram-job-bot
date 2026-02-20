@@ -1,7 +1,6 @@
 import os
 import json
 import asyncio
-import threading
 from telethon import TelegramClient, events
 from telegram import Update
 from telegram.ext import (
@@ -13,13 +12,12 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ── Credentials (loaded from Railway environment variables) ──────────────────
+# ── Credentials ──────────────────────────────────────────────────────────────
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
-PHONE = os.environ.get("PHONE")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# ── Keywords to watch for ────────────────────────────────────────────────────
+# ── Keywords ─────────────────────────────────────────────────────────────────
 KEYWORDS = [
     "chat",
     "chatter",
@@ -28,10 +26,10 @@ KEYWORDS = [
     "chatters",
 ]
 
-# ── Conversation steps ───────────────────────────────────────────────────────
+# ── Conversation steps ────────────────────────────────────────────────────────
 COUNTRY, PAYMENT, USERNAME = range(3)
 
-# ── Session storage ──────────────────────────────────────────────────────────
+# ── Session storage ───────────────────────────────────────────────────────────
 SESSIONS_FILE = "sessions.json"
 
 
@@ -49,79 +47,12 @@ def save_sessions(sessions):
 
 user_sessions = load_sessions()
 
-
-# ════════════════════════════════════════════════════════════════════════════
-#  PART 1 — TELETHON USERBOT (reads group messages as a real user account)
-# ════════════════════════════════════════════════════════════════════════════
-
+# ── Telethon client — uses saved session file, never asks for code ────────────
 userbot = TelegramClient("userbot_session", API_ID, API_HASH)
 
 
-async def start_userbot():
-    await userbot.start(phone=PHONE)
-    print("✅ Userbot logged in successfully.")
-
-    @userbot.on(events.NewMessage)
-    async def handle_group_message(event):
-        if not event.is_group and not event.is_channel:
-            return
-
-        message_text = event.raw_text or ""
-        message_text_lower = message_text.lower()
-
-        matched_keyword = None
-        for keyword in KEYWORDS:
-            if keyword in message_text_lower:
-                matched_keyword = keyword
-                break
-
-        if not matched_keyword:
-            return
-
-        chat = await event.get_chat()
-        message_id = event.message.id
-        chat_username = getattr(chat, "username", None)
-
-        if chat_username:
-            message_link = f"https://t.me/{chat_username}/{message_id}"
-        else:
-            chat_id_str = str(chat.id).lstrip("-")
-            message_link = f"https://t.me/c/{chat_id_str}/{message_id}"
-
-        sender = await event.get_sender()
-        sender_name = getattr(sender, "first_name", "Unknown")
-        sender_username = f"@{sender.username}" if getattr(sender, "username", None) else "no username"
-        group_name = getattr(chat, "title", "Unknown Group")
-
-        forward_message = (
-            f"🔔 *New match found!*\n\n"
-            f"📌 Keyword: `{matched_keyword}`\n"
-            f"👤 Sent by: {sender_name} ({sender_username})\n"
-            f"💬 Group: {group_name}\n\n"
-            f"📝 Message:\n{message_text[:500]}\n\n"
-            f"🔗 [View message]({message_link})"
-        )
-
-        sessions = load_sessions()
-        for uid, session in sessions.items():
-            if not session.get("username"):
-                continue
-            try:
-                await userbot.send_message(
-                    session["username"],
-                    forward_message,
-                    parse_mode="md",
-                    link_preview=True,
-                )
-                print(f"Forwarded to @{session['username']}")
-            except Exception as e:
-                print(f"Could not forward to @{session['username']}: {e}")
-
-    await userbot.run_until_disconnected()
-
-
 # ════════════════════════════════════════════════════════════════════════════
-#  PART 2 — TELEGRAM BOT (handles /start registration)
+#  REGISTRATION BOT HANDLERS
 # ════════════════════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -168,7 +99,7 @@ async def collect_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📍 Country: {user_sessions[user_id]['country']}\n"
         f"💰 Payment: {user_sessions[user_id]['payment']}\n"
         f"👤 Forward to: @{username}\n\n"
-        f"I'll now monitor groups and forward matching messages to you.\n"
+        f"I'll monitor groups and forward matching messages to you.\n"
         f"Use /stop to stop receiving messages."
     )
     return ConversationHandler.END
@@ -186,12 +117,87 @@ async def stop_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Registration cancelled. Use /start to try again.")
+    await update.message.reply_text("❌ Cancelled. Use /start to try again.")
     return ConversationHandler.END
 
 
-def run_bot():
+# ════════════════════════════════════════════════════════════════════════════
+#  GROUP MESSAGE MONITOR (Telethon)
+# ════════════════════════════════════════════════════════════════════════════
+
+@userbot.on(events.NewMessage)
+async def handle_group_message(event):
+    if not event.is_group and not event.is_channel:
+        return
+
+    message_text = event.raw_text or ""
+    message_text_lower = message_text.lower()
+
+    matched_keyword = None
+    for keyword in KEYWORDS:
+        if keyword in message_text_lower:
+            matched_keyword = keyword
+            break
+
+    if not matched_keyword:
+        return
+
+    chat = await event.get_chat()
+    message_id = event.message.id
+    chat_username = getattr(chat, "username", None)
+
+    if chat_username:
+        message_link = f"https://t.me/{chat_username}/{message_id}"
+    else:
+        chat_id_str = str(chat.id).lstrip("-")
+        message_link = f"https://t.me/c/{chat_id_str}/{message_id}"
+
+    sender = await event.get_sender()
+    sender_name = getattr(sender, "first_name", "Unknown")
+    sender_username = f"@{sender.username}" if getattr(sender, "username", None) else "no username"
+    group_name = getattr(chat, "title", "Unknown Group")
+
+    forward_message = (
+        f"🔔 *New match found!*\n\n"
+        f"📌 Keyword: `{matched_keyword}`\n"
+        f"👤 Sent by: {sender_name} ({sender_username})\n"
+        f"💬 Group: {group_name}\n\n"
+        f"📝 Message:\n{message_text[:500]}\n\n"
+        f"🔗 [View message]({message_link})"
+    )
+
+    sessions = load_sessions()
+    for uid, session in sessions.items():
+        if not session.get("username"):
+            continue
+        try:
+            await userbot.send_message(
+                session["username"],
+                forward_message,
+                parse_mode="md",
+                link_preview=True,
+            )
+            print(f"✅ Forwarded to @{session['username']}")
+        except Exception as e:
+            print(f"❌ Could not forward to @{session['username']}: {e}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  MAIN — run everything in one async loop
+# ════════════════════════════════════════════════════════════════════════════
+
+async def main():
+    # Connect userbot using saved session file (no login code needed)
+    await userbot.connect()
+    if not await userbot.is_user_authorized():
+        print("❌ ERROR: Userbot session is not authorized. Please regenerate the session file.")
+        return
+
+    print("✅ Userbot connected successfully.")
+
+    # Build and start the registration bot
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -203,15 +209,24 @@ def run_bot():
     )
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("stop", stop_search))
+
     print("✅ Registration bot is running...")
-    app.run_polling()
 
+    # Run both concurrently in the same event loop
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
 
-# ════════════════════════════════════════════════════════════════════════════
-#  MAIN — run both parts together
-# ════════════════════════════════════════════════════════════════════════════
+    print("✅ Both userbot and registration bot are running!")
+
+    # Keep running until disconnected
+    await userbot.run_until_disconnected()
+
+    # Cleanup
+    await app.updater.stop()
+    await app.stop()
+    await app.shutdown()
+
 
 if __name__ == "__main__":
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    asyncio.run(start_userbot())
+    asyncio.run(main())
