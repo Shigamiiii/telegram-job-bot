@@ -1,6 +1,8 @@
 import os
 import json
-import time
+import asyncio
+import threading
+from telethon import TelegramClient, events
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -11,13 +13,13 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ── Load bot token ──────────────────────────────────────────────────────────
-TOKEN = os.environ.get("BOT_TOKEN")
+# ── Credentials (loaded from Railway environment variables) ──────────────────
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+PHONE = os.environ.get("PHONE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# ── Conversation steps ───────────────────────────────────────────────────────
-COUNTRY, PAYMENT, USERNAME = range(3)
-
-# ── Keywords to watch for in group messages ──────────────────────────────────
+# ── Keywords to watch for ────────────────────────────────────────────────────
 KEYWORDS = [
     "chat",
     "chatter",
@@ -26,7 +28,10 @@ KEYWORDS = [
     "chatters",
 ]
 
-# ── File to save user sessions so data survives restarts ────────────────────
+# ── Conversation steps ───────────────────────────────────────────────────────
+COUNTRY, PAYMENT, USERNAME = range(3)
+
+# ── Session storage ──────────────────────────────────────────────────────────
 SESSIONS_FILE = "sessions.json"
 
 
@@ -45,144 +50,48 @@ def save_sessions(sessions):
 user_sessions = load_sessions()
 
 
-# ── /start command – begins registration ─────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    user_sessions[user_id] = {
-        "start_time": time.time(),
-        "country": None,
-        "payment": None,
-        "username": None,
-    }
-    save_sessions(user_sessions)
-    await update.message.reply_text(
-        "👋 Welcome! Let's get you set up.\n\nStep 1 of 3: What country are you in?"
-    )
-    return COUNTRY
+# ════════════════════════════════════════════════════════════════════════════
+#  PART 1 — TELETHON USERBOT (reads group messages as a real user account)
+# ════════════════════════════════════════════════════════════════════════════
+
+userbot = TelegramClient("userbot_session", API_ID, API_HASH)
 
 
-# ── Step 1: collect country ──────────────────────────────────────────────────
-async def collect_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    user_sessions[user_id]["country"] = update.message.text.strip()
-    save_sessions(user_sessions)
-    await update.message.reply_text(
-        "✅ Got it!\n\nStep 2 of 3: What is your preferred payment type?\nReply with: hourly, commission, or both"
-    )
-    return PAYMENT
+async def start_userbot():
+    await userbot.start(phone=PHONE)
+    print("✅ Userbot logged in successfully.")
 
+    @userbot.on(events.NewMessage)
+    async def handle_group_message(event):
+        if not event.is_group and not event.is_channel:
+            return
 
-# ── Step 2: collect payment type ─────────────────────────────────────────────
-async def collect_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    payment = update.message.text.strip().lower()
+        message_text = event.raw_text or ""
+        message_text_lower = message_text.lower()
 
-    if payment not in ["hourly", "commission", "both"]:
-        await update.message.reply_text(
-            "⚠️ Please reply with one of these options: hourly, commission, or both"
-        )
-        return PAYMENT
+        matched_keyword = None
+        for keyword in KEYWORDS:
+            if keyword in message_text_lower:
+                matched_keyword = keyword
+                break
 
-    user_sessions[user_id]["payment"] = payment
-    save_sessions(user_sessions)
-    await update.message.reply_text(
-        "✅ Got it!\n\nStep 3 of 3: What is your Telegram username? (without the @)"
-    )
-    return USERNAME
+        if not matched_keyword:
+            return
 
+        chat = await event.get_chat()
+        message_id = event.message.id
+        chat_username = getattr(chat, "username", None)
 
-# ── Step 3: collect username and finish registration ──────────────────────────
-async def collect_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    username = update.message.text.strip().replace("@", "")
-    user_sessions[user_id]["username"] = username
-    save_sessions(user_sessions)
+        if chat_username:
+            message_link = f"https://t.me/{chat_username}/{message_id}"
+        else:
+            chat_id_str = str(chat.id).lstrip("-")
+            message_link = f"https://t.me/c/{chat_id_str}/{message_id}"
 
-    country = user_sessions[user_id]["country"]
-    payment = user_sessions[user_id]["payment"]
-
-    await update.message.reply_text(
-        f"🎉 You're all set!\n\n"
-        f"📍 Country: {country}\n"
-        f"💰 Payment: {payment}\n"
-        f"👤 Forward to: @{username}\n\n"
-        f"I'll now watch group messages and forward anything relevant to you.\n"
-        f"Use /stop to stop receiving messages."
-    )
-    return ConversationHandler.END
-
-
-# ── /stop command – unregisters the user ─────────────────────────────────────
-async def stop_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    if user_id in user_sessions:
-        user_sessions.pop(user_id)
-        save_sessions(user_sessions)
-        await update.message.reply_text(
-            "🛑 Stopped. You won't receive any more forwarded messages.\n"
-            "Use /start to register again anytime."
-        )
-    else:
-        await update.message.reply_text("You're not currently registered. Use /start to begin.")
-    return ConversationHandler.END
-
-
-# ── /cancel during registration ───────────────────────────────────────────────
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Registration cancelled. Use /start to try again.")
-    return ConversationHandler.END
-
-
-# ── Filter group messages and forward matches ─────────────────────────────────
-async def filter_group_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only handle messages from groups/supergroups
-    if update.message is None:
-        return
-    if update.message.chat.type not in ["group", "supergroup"]:
-        return
-
-    message_text = update.message.text or ""
-    message_text_lower = message_text.lower()
-
-    # Check if message contains any keyword
-    matched_keyword = None
-    for keyword in KEYWORDS:
-        if keyword in message_text_lower:
-            matched_keyword = keyword
-            break
-
-    if not matched_keyword:
-        return  # No match, ignore the message
-
-    # Build the message link
-    chat = update.message.chat
-    message_id = update.message.message_id
-
-    if chat.username:
-        # Public group – link works for everyone
-        message_link = f"https://t.me/{chat.username}/{message_id}"
-    else:
-        # Private group – link only works for members
-        chat_id_str = str(chat.id).replace("-100", "")
-        message_link = f"https://t.me/c/{chat_id_str}/{message_id}"
-
-    sender = update.message.from_user
-    sender_name = sender.full_name if sender else "Unknown"
-    sender_username = f"@{sender.username}" if sender and sender.username else "no username"
-    group_name = chat.title or "Unknown Group"
-
-    # Forward to all registered users whose payment type matches (or is "both")
-    for uid, session in user_sessions.items():
-        if not session.get("username"):
-            continue
-
-        # Optional: filter by payment preference if message mentions it
-        payment_pref = session.get("payment", "both")
-        if payment_pref != "both":
-            if payment_pref not in message_text_lower:
-                # If their preference word isn't in the message, still forward
-                # (keyword match is enough — remove this block to be stricter)
-                pass
+        sender = await event.get_sender()
+        sender_name = getattr(sender, "first_name", "Unknown")
+        sender_username = f"@{sender.username}" if getattr(sender, "username", None) else "no username"
+        group_name = getattr(chat, "title", "Unknown Group")
 
         forward_message = (
             f"🔔 *New match found!*\n\n"
@@ -193,22 +102,96 @@ async def filter_group_messages(update: Update, context: ContextTypes.DEFAULT_TY
             f"🔗 [View message]({message_link})"
         )
 
-        try:
-            await context.bot.send_message(
-                chat_id=f"@{session['username']}",
-                text=forward_message,
-                parse_mode="Markdown",
-                disable_web_page_preview=False,
-            )
-        except Exception as e:
-            print(f"Could not forward to @{session['username']}: {e}")
+        sessions = load_sessions()
+        for uid, session in sessions.items():
+            if not session.get("username"):
+                continue
+            try:
+                await userbot.send_message(
+                    session["username"],
+                    forward_message,
+                    parse_mode="md",
+                    link_preview=True,
+                )
+                print(f"Forwarded to @{session['username']}")
+            except Exception as e:
+                print(f"Could not forward to @{session['username']}: {e}")
+
+    await userbot.run_until_disconnected()
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    app = ApplicationBuilder().token(TOKEN).build()
+# ════════════════════════════════════════════════════════════════════════════
+#  PART 2 — TELEGRAM BOT (handles /start registration)
+# ════════════════════════════════════════════════════════════════════════════
 
-    # Conversation handler for registration flow
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    user_sessions[user_id] = {"country": None, "payment": None, "username": None}
+    save_sessions(user_sessions)
+    await update.message.reply_text(
+        "👋 Welcome! Let's get you set up.\n\nStep 1 of 3: What country are you in?"
+    )
+    return COUNTRY
+
+
+async def collect_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    user_sessions[user_id]["country"] = update.message.text.strip()
+    save_sessions(user_sessions)
+    await update.message.reply_text(
+        "✅ Got it!\n\nStep 2 of 3: What is your preferred payment type?\nReply with: hourly, commission, or both"
+    )
+    return PAYMENT
+
+
+async def collect_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    payment = update.message.text.strip().lower()
+    if payment not in ["hourly", "commission", "both"]:
+        await update.message.reply_text("⚠️ Please reply with: hourly, commission, or both")
+        return PAYMENT
+    user_sessions[user_id]["payment"] = payment
+    save_sessions(user_sessions)
+    await update.message.reply_text(
+        "✅ Got it!\n\nStep 3 of 3: What is your Telegram username? (without the @)"
+    )
+    return USERNAME
+
+
+async def collect_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    username = update.message.text.strip().replace("@", "")
+    user_sessions[user_id]["username"] = username
+    save_sessions(user_sessions)
+    await update.message.reply_text(
+        f"🎉 You're all set!\n\n"
+        f"📍 Country: {user_sessions[user_id]['country']}\n"
+        f"💰 Payment: {user_sessions[user_id]['payment']}\n"
+        f"👤 Forward to: @{username}\n\n"
+        f"I'll now monitor groups and forward matching messages to you.\n"
+        f"Use /stop to stop receiving messages."
+    )
+    return ConversationHandler.END
+
+
+async def stop_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if user_id in user_sessions:
+        user_sessions.pop(user_id)
+        save_sessions(user_sessions)
+        await update.message.reply_text("🛑 Stopped. Use /start to register again.")
+    else:
+        await update.message.reply_text("You're not registered. Use /start to begin.")
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Registration cancelled. Use /start to try again.")
+    return ConversationHandler.END
+
+
+def run_bot():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -218,14 +201,17 @@ if __name__ == "__main__":
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("stop", stop_search)],
     )
-
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("stop", stop_search))
-
-    # Listen to ALL messages (including from groups the bot is added to)
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, filter_group_messages)
-    )
-
-    print("Bot is running...")
+    print("✅ Registration bot is running...")
     app.run_polling()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  MAIN — run both parts together
+# ════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    asyncio.run(start_userbot())
