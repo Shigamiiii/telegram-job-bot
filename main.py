@@ -52,3 +52,5 @@ async def stop_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Search stopped. The bot will no longer forward messages.")
 
 async def filter_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    print(f"User {user_id} said: {update.message.text}")
